@@ -1,0 +1,15 @@
+parameters:
+    treatPhpDocTypesAsCertain: false
+    checkGenericClassInNonGenericObjectType: false
+    ignoreErrors:
+        - '#Static property [a-zA-Z0-9\\_]+::\$db is never read, only written\.#'
+        - '#Static property [a-zA-Z0-9\\_]+::\$table is never read, only written\.#'
+        - '#Static property [a-zA-Z0-9\\_]+::\$singular_name is never read, only written\.#'
+        - '#Static property [a-zA-Z0-9\\_]+::\$plural_name is never read, only written\.#'
+        - '#Static property [a-zA-Z0-9\\_]+::\$summary_fields is never read, only written\.#'
+    level: 4
+    paths:
+        - code
+    scanDirectories:
+        # - vendor
+        - ../vendor

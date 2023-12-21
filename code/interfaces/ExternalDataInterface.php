@@ -3,7 +3,7 @@ namespace Gurucomkz\ExternalData\Interfaces;
 
 interface ExternalDataInterface
 {
-	public function write();
+    public function write();
 
-	public function delete();
+    public function delete();
 }
