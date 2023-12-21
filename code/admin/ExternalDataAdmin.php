@@ -1,4 +1,18 @@
 <?php
+namespace Gurucomkz\ExternalData\Admin;
+
+use Gurucomkz\ExternalData\Forms\ExternalDataGridFieldDeleteAction;
+use Gurucomkz\ExternalData\Forms\ExternalDataGridFieldDetailForm;
+use SilverStripe\Admin\ModelAdmin;
+use SilverStripe\Control\Controller;
+use SilverStripe\Forms\FieldList;
+use SilverStripe\Forms\Form;
+use SilverStripe\Forms\GridField\GridField;
+use SilverStripe\Forms\GridField\GridFieldConfig_RecordEditor;
+use SilverStripe\Forms\GridField\GridFieldDeleteAction;
+use SilverStripe\Forms\GridField\GridFieldDetailForm;
+use SilverStripe\Forms\GridField\GridFieldFilterHeader;
+
 /**
  * ExternalDataAdmin
  *
@@ -7,37 +21,41 @@
  * @author     Martijn van Nieuwenhoven <info@axyrmedia.nl>
  */
 
-abstract class ExternalDataAdmin extends ModelAdmin {
-	static $url_segment 	= '';
-	static $menu_title 		= 'External Data';
-	static $page_length 	= 10;
-	static $default_model 	= '';	
-	
-	static $managed_models	= array(
-	);	
-	
-	public function getEditForm($id = null, $fields = null) {
+abstract class ExternalDataAdmin extends ModelAdmin
+{
+	static $url_segment     = '';
+	static $menu_title      = 'External Data';
+	static $page_length     = 10;
+	static $default_model   = '';
+
+	static $managed_models  = [
+	];
+
+	public function getEditForm($id = null, $fields = null)
+	{
 		$list = $this->getList();
 
 		$listField = GridField::create(
 			$this->sanitiseClassName($this->modelClass),
 			false,
 			$list,
-			$fieldConfig = GridFieldConfig_RecordEditor::create($this->stat('page_length'))
-				->removeComponentsByType('GridFieldFilterHeader')
-				->removeComponentsByType('GridFieldDetailForm')
-				->removeComponentsByType('GridFieldDeleteAction')
+			$fieldConfig = GridFieldConfig_RecordEditor::create($this->config()->get('page_length'))
+				->removeComponentsByType(GridFieldFilterHeader::class)
+				->removeComponentsByType(GridFieldDetailForm::class)
+				->removeComponentsByType(GridFieldDeleteAction::class)
 				->addComponents(new ExternalDataGridFieldDetailForm())
 				->addComponents(new ExternalDataGridFieldDeleteAction())
 		);
 
 		// Validation
-		if(singleton($this->modelClass)->hasMethod('getCMSValidator')) {
+		if (singleton($this->modelClass)->hasMethod('getCMSValidator')) {
 			$detailValidator = singleton($this->modelClass)->getCMSValidator();
-			$listField->getConfig()->getComponentByType('GridFieldDetailForm')->setValidator($detailValidator);
+			/** @var GridFieldDetailForm $detailForm */
+			$detailForm = $listField->getConfig()->getComponentByType(GridFieldDetailForm::class);
+			$detailForm->setValidator($detailValidator);
 		}
 
-		$form = CMSForm::create( 
+		$form = Form::create(
 			$this,
 			'EditForm',
 			new FieldList($listField),
@@ -53,8 +71,9 @@ abstract class ExternalDataAdmin extends ModelAdmin {
 		$this->extend('updateEditForm', $form);
 		return $form;
 	}
-	
-	public function getList() {
+
+	public function getList()
+	{
 		$class = $this->modelClass;
 		$list =  $class::get();
 		$list->dataModel = $class;
@@ -67,24 +86,28 @@ abstract class ExternalDataAdmin extends ModelAdmin {
 		*/
 		return $list;
 	}
-	
-	public function getRecord($id) {
+
+	public function getRecord($id)
+	{
 		$className = $this->modelClass;
-		if($className && $id instanceof $className) {
+		if ($className && $id instanceof $className) {
 			return $id;
-		} else if($id == 'root') {
+		} elseif ($id == 'root') {
 			return singleton($className);
-		} else if($id) {
+		} elseif ($id) {
 			return $className::get_by_id($id);
 		} else {
 			return false;
 		}
 	}
-	
-	public function getSearchContext() {	
+
+	public function getSearchContext()
+	{
 	}
-	public function SearchForm() {
+	public function SearchForm()
+	{
 	}
-	public function ImportForm() {
+	public function ImportForm()
+	{
 	}
 }
