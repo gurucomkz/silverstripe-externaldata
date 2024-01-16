@@ -29,9 +29,5 @@
         "psr-4": {
             "Gurucomkz\\ExternalData\\": "code"
         }
-    },
-    "extra": {
-        "installer-name": "externaldata"
-    },
-    "target-dir": "externaldata"
+    }
 }
