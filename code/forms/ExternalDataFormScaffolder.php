@@ -22,6 +22,14 @@ class ExternalDataFormScaffolder extends FormScaffolder
     protected $obj;
 
     /**
+     * @param ExternalDataObject $obj
+     */
+    public function __construct($obj)
+    {
+        $this->obj = $obj;
+    }
+
+    /**
      * Gets the form fields as defined through the metadata
      * on {@link $obj} and the custom parameters passed to FormScaffolder.
      * Depending on those parameters, the fields can be used in ajax-context,

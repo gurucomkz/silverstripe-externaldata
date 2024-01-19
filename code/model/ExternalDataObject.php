@@ -1,14 +1,33 @@
 <?php
 namespace Gurucomkz\ExternalData\Model;
 
+use Exception;
 use Gurucomkz\ExternalData\Forms\ExternalDataFormScaffolder;
-use Gurucomkz\ExternalData\Interfaces\ExternalDataInterface;
 use Gurucomkz\ExternalData\Model\FieldTypes\ExternalDataObjectPrimaryKey;
+use InvalidArgumentException;
+use LogicException;
+use MongoDB\Model\BSONDocument;
+use MongoDB\BSON\UTCDateTime;
 use SilverStripe\Core\ClassInfo;
 use SilverStripe\Core\Config\Config;
+use SilverStripe\Core\Injector\Injector;
+use SilverStripe\Core\Resettable;
+use SilverStripe\Dev\Deprecation;
 use SilverStripe\Forms\CompositeField;
+use SilverStripe\Forms\CompositeValidator;
+use SilverStripe\Forms\FieldList;
+use SilverStripe\Forms\FieldsValidator;
 use SilverStripe\Forms\FormField;
+use SilverStripe\Forms\HiddenField;
+use SilverStripe\ORM\ArrayList;
+use SilverStripe\ORM\DataObject;
+use SilverStripe\ORM\DataObjectInterface;
+use SilverStripe\ORM\DB;
+use SilverStripe\ORM\FieldType\DBComposite;
 use SilverStripe\ORM\FieldType\DBField;
+use SilverStripe\ORM\Search\SearchContext;
+use SilverStripe\ORM\ValidationException;
+use SilverStripe\ORM\ValidationResult;
 use SilverStripe\Security\Permission;
 use SilverStripe\View\ArrayData;
 use SilverStripe\View\ViewableData;
@@ -43,9 +62,9 @@ use SilverStripe\View\ViewableData;
  *
  * @property mixed $ID
  */
-abstract class ExternalDataObject extends ArrayData implements ExternalDataInterface
+abstract class ExternalDataObject extends ArrayData implements DataObjectInterface, Resettable
 {
-    private static $table;
+    private static $table_name;
 
     private static $db = [
         'ID' => 'Varchar'
@@ -53,6 +72,7 @@ abstract class ExternalDataObject extends ArrayData implements ExternalDataInter
 
     private $changed;
     protected $record;
+    protected $class;
 
     private static $singular_name = null;
     private static $plural_name = null;
@@ -63,8 +83,40 @@ abstract class ExternalDataObject extends ArrayData implements ExternalDataInter
     protected static $_cache_field_labels = [];
     protected static $_cache_composite_fields = [];
 
+
+    /**
+     * Used by onBeforeDelete() to ensure child classes call parent::onBeforeDelete()
+     * @var boolean
+     */
+    protected $brokenOnDelete = false;
+
+    /**
+     * Used by onBeforeWrite() to ensure child classes call parent::onBeforeWrite()
+     * @var boolean
+     */
+    protected $brokenOnWrite = false;
+
+    /**
+     * A flag to indicate that a "strict" change of the entire record been forced
+     * Use {@link getChangedFields()} and {@link isChanged()} to inspect
+     * the changed state.
+     *
+     * @var boolean
+     */
+    private $changeForced = false;
+
+    /**
+     * The database record (in the same format as $record), before
+     * any changes.
+     * @var array
+     */
+    protected $original = [];
+
     public function __construct($data = [])
     {
+        if ($data instanceof BSONDocument) {
+            $data = $this->bsonToArray($data);
+        }
 
         foreach ($data as $k => $v) {
             if ($v !== null) {
@@ -79,7 +131,60 @@ abstract class ExternalDataObject extends ArrayData implements ExternalDataInter
         }
 
         $this->record = $data;
+        $this->class = get_called_class();
+
+        $this->original = $this->record ?? [];
+
         parent::__construct($data);
+    }
+
+    public function bsonToArray(BSONDocument $document): array
+    {
+        $record = [];
+
+        foreach ($document as $key => $value) {
+            switch (true) {
+                case $value instanceof BSONDocument:
+                    $value = json_encode($value);
+                    break;
+
+                case $value instanceof UTCDateTime:
+                    $value = $value->toDateTime();
+                    break;
+            }
+
+            $record[$key] = $value;
+        }
+
+        return $record;
+    }
+
+    public function hasOne()
+    {
+        return [];
+    }
+    public function hasMany()
+    {
+        return [];
+    }
+    public function manyMany()
+    {
+        return [];
+    }
+
+    public function defaultSearchFilters()
+    {
+        return [];
+    }
+
+    public function relObject($fieldPath)
+    {
+        return null;
+    }
+
+    public function getGeneralSearchFieldName(): string
+    {
+        return $this->config()->get('general_search_field_name') ?? '';
     }
 
     public static function is_composite_field($class, $name, $aggregated = true)
@@ -91,7 +196,7 @@ abstract class ExternalDataObject extends ArrayData implements ExternalDataInter
 
         if (isset(ExternalDataObject::$_cache_composite_fields[$class][$name])) {
             return ExternalDataObject::$_cache_composite_fields[$class][$name];
-        } elseif ($aggregated && $class != 'ExternalDataObject' && ($parentClass=get_parent_class($class)) != 'ExternalDataObject') {
+        } elseif ($aggregated && $class != ExternalDataObject::class && ($parentClass=get_parent_class($class)) != ExternalDataObject::class) {
             return self::is_composite_field($parentClass, $name);
         }
     }
@@ -145,13 +250,95 @@ abstract class ExternalDataObject extends ArrayData implements ExternalDataInter
     }
 
     /**
-     * Child classes should call $list = parent::get();
+     * Return all objects matching the filter
+     * sub-classes are automatically selected and included
+     *
+     * @param string $callerClass The class of objects to be returned
+     * @param string|array $filter A filter to be inserted into the WHERE clause.
+     * Supports parameterised queries. See SQLSelect::addWhere() for syntax examples.
+     * @param string|array $sort A sort expression to be inserted into the ORDER
+     * BY clause.  If omitted, self::$default_sort will be used.
+     * @param string $join Deprecated 3.0 Join clause. Use leftJoin($table, $joinClause) instead.
+     * @param string|array $limit A limit expression to be inserted into the LIMIT clause.
+     * @param string $containerClass The container class to return the results in.
+     *
+     * @todo $containerClass is Ignored, why?
+     *
+     * @return ExternalDataList The objects matching the filter, in the class specified by $containerClass
      */
-    public static function get()
+    public static function get(
+        $callerClass = null,
+        $filter = "",
+        $sort = "",
+        $join = "",
+        $limit = null,
+        $containerClass = ExternalDataList::class
+    ) {
+        // Validate arguments
+        if ($callerClass == null) {
+            $callerClass = get_called_class();
+            if ($callerClass === self::class) {
+                throw new InvalidArgumentException('Call <classname>::get() instead of ExternalDataList::get()');
+            }
+            if ($filter || $sort || $join || $limit || ($containerClass !== ExternalDataList::class)) {
+                throw new InvalidArgumentException('If calling <classname>::get() then you shouldn\'t pass any other'
+                    . ' arguments');
+            }
+        } elseif ($callerClass === self::class) {
+            throw new InvalidArgumentException('ExternalDataList::get() cannot query non-subclass ExternalDataList directly');
+        }
+        if ($join) {
+            throw new InvalidArgumentException(
+                'The $join argument has been removed.'
+            );
+        }
+
+        // Build and decorate with args
+        $result = static::getDataList($callerClass);
+        if ($filter) {
+            $result = $result->filter($filter);
+        }
+        if ($sort) {
+            $result = $result->sort($sort);
+        }
+        if ($limit && strpos($limit ?? '', ',') !== false) {
+            $limitArguments = explode(',', $limit ?? '');
+            $result = $result->limit($limitArguments[1], $limitArguments[0]);
+        } elseif ($limit) {
+            $result = $result->limit($limit);
+        }
+
+        return $result;
+    }
+
+    abstract public static function getDataList(string $callerClass): ExternalDataList;
+
+    public static function get_one($callerClass, $filter = "", $cache = true, $orderby = "")
     {
-        $list = ExternalDataList::create();
-        $list->dataClass = get_called_class();
-        return $list;
+        /** @var ExternalDataObject $singleton */
+        $singleton = singleton($callerClass);
+
+        $cacheComponents = [$filter, $orderby, $singleton->getUniqueKeyComponents()];
+        $cacheKey = md5(serialize($cacheComponents));
+
+        $item = null;
+        if (!$cache || !isset(self::$_cache_get_one[$callerClass][$cacheKey])) {
+            $dl = ExternalDataObject::get($callerClass)->filter($filter)->sort($orderby);
+            $item = $dl->first();
+
+            if ($cache) {
+                self::$_cache_get_one[$callerClass][$cacheKey] = $item;
+                if (!self::$_cache_get_one[$callerClass][$cacheKey]) {
+                    self::$_cache_get_one[$callerClass][$cacheKey] = false;
+                }
+            }
+        }
+
+        if ($cache) {
+            return self::$_cache_get_one[$callerClass][$cacheKey] ?: null;
+        }
+
+        return $item;
     }
 
     public function getID()
@@ -252,7 +439,7 @@ abstract class ExternalDataObject extends ArrayData implements ExternalDataInter
                     }
                 }
 
-                $items = isset($items) ? array_merge((array) $items, $dbItems) : $dbItems;
+                $items = array_merge((array) $items, $dbItems);
             }
         }
 
@@ -261,17 +448,20 @@ abstract class ExternalDataObject extends ArrayData implements ExternalDataInter
 
     public function dbObject($fieldName)
     {
-        // If we have a CompositeDBField object in $this->record, then return that
-        if (isset($this->record[$fieldName]) && is_object($this->record[$fieldName])) {
-            return $this->record[$fieldName];
+        $value = isset($this->record[$fieldName])
+            ? $this->record[$fieldName]
+            : null;
 
+        // If we have a CompositeDBField object in $this->record, then return that
+        if (is_object($value)) {
+            return $value;
         // Special case for ID field
         } elseif ($fieldName == 'ID') { // sure?
             return new ExternalDataObjectPrimaryKey('ID', $this->ID); // ?Varchar
         // General casting information for items in $db
-        } elseif ($helper = $this->db($fieldName)) {
-            $obj = Object::create_from_string($helper, $fieldName);
-            $obj->setValue($this->$fieldName, $this->record, false);
+        } elseif ($spec = $this->db($fieldName)) {
+            $obj = Injector::inst()->create($spec, $fieldName);
+            $obj->setValue($value, $this, false);
             return $obj;
         }
     }
@@ -324,7 +514,6 @@ abstract class ExternalDataObject extends ArrayData implements ExternalDataInter
         return (
             array_key_exists($field, $this->record)
             || $this->db($field)
-            || (substr($field, -2) == 'ID') && $this->has_one(substr($field, 0, -2))
             || $this->hasMethod("get{$field}")
         );
     }
@@ -333,13 +522,12 @@ abstract class ExternalDataObject extends ArrayData implements ExternalDataInter
     {
         // Situation 1: Passing an DBField
         if ($val instanceof DBField) {
-            $val->Name = $fieldName;
+            $val->setName($fieldName);
+            $val->saveInto($this);
 
-            // If we've just lazy-loaded the column, then we need to populate the $original array by
-            // called getField(). Too much overhead? Could this be done by a quicker method? Maybe only
-            // on a call to getChanged()?
-            $this->getField($fieldName);
-
+            if ($val instanceof DBComposite) {
+                $val->bindTo($this);
+            }
             $this->record[$fieldName] = $val;
         // Situation 2: Passing a literal or non-DBField object
         } else {
@@ -374,57 +562,38 @@ abstract class ExternalDataObject extends ArrayData implements ExternalDataInter
         return $this;
     }
 
-    public function setCastedField($fieldName, $val)
+    public function setCastedField($fieldName, $value)
     {
         if (!$fieldName) {
-            user_error("ExternalDataObject::setCastedField: Called without a fieldName", E_USER_ERROR);
+            throw new InvalidArgumentException("ExternalDataObject::setCastedField: Called without a fieldName");
         }
-        $castingHelper = $this->castingHelper($fieldName);
-        if ($castingHelper) {
-            $fieldObj = Object::create_from_string($castingHelper, $fieldName);
-            $fieldObj->setValue($val);
+        $fieldObj = $this->dbObject($fieldName);
+        if ($fieldObj) {
+            $fieldObj->setValue($value);
             $fieldObj->saveInto($this);
         } else {
-            $this->$fieldName = $val;
+            $this->$fieldName = $value;
         }
         return $this;
     }
 
+    /**
+     * need to be overload by solid dataobject, so that the customised actions of that dataobject,
+     * including that dataobject's extensions customised actions could be added to the EditForm.
+     *
+     * @return FieldList an Empty FieldList(); need to be overload by solid subclass
+     */
+    public function getCMSActions()
+    {
+        $actions = new FieldList();
+        $this->extend('updateCMSActions', $actions);
+        return $actions;
+    }
+
     public function getField($field)
     {
-        // If we already have an object in $this->record, then we should just return that
-        if (isset($this->record[$field]) && is_object($this->record[$field])) {
-            return $this->record[$field];
-        }
-
-        // Do we have a field that needs to be lazy loaded?
-        if (isset($this->record[$field . '_Lazy'])) {
-            $tableClass = $this->record[$field . '_Lazy'];
-            $this->loadLazyFields($tableClass);
-        }
-
-        // Otherwise, we need to determine if this is a complex field
-        if (self::is_composite_field($this->class, $field)) {
-            $helper = $this->castingHelper($field);
-            $fieldObj = Object::create_from_string($helper, $field);
-
-            $compositeFields = $fieldObj->compositeDatabaseFields();
-            foreach ($compositeFields as $compositeName => $compositeType) {
-                if (isset($this->record[$field . $compositeName . '_Lazy'])) {
-                    $tableClass = $this->record[$field . $compositeName . '_Lazy'];
-                    $this->loadLazyFields($tableClass);
-                }
-            }
-
-            // write value only if either the field value exists,
-            // or a valid record has been loaded from the database
-            $value = (isset($this->record[$field])) ? $this->record[$field] : null;
-            if ($value || $this->exists()) {
-                $fieldObj->setValue($value, $this->record, false);
-            }
-
-            $this->record[$field] = $fieldObj;
-
+        // If we already have a value in $this->record, then we should just return that
+        if (isset($this->record[$field])) {
             return $this->record[$field];
         }
 
@@ -439,11 +608,15 @@ abstract class ExternalDataObject extends ArrayData implements ExternalDataInter
 
     public function singular_name()
     {
-        if (!$name = $this->config()->get('singular_name')) {
-            $name = ucwords(trim(strtolower(preg_replace('/_?([A-Z])/', ' $1', $this->class))));
+        $name = $this->config()->get('singular_name');
+        if ($name) {
+            return $name;
         }
-
-        return $name;
+        return ucwords(trim(strtolower(preg_replace(
+            '/_?([A-Z])/',
+            ' $1',
+            ClassInfo::shortName($this) ?? ''
+        ) ?? '')));
     }
 
     public function i18n_singular_name()
@@ -455,16 +628,13 @@ abstract class ExternalDataObject extends ArrayData implements ExternalDataInter
     {
         if ($name = $this->config()->get('plural_name')) {
             return $name;
-        } else {
-            $name = $this->singular_name();
-            if (substr($name, -1) == 'e') {
-                $name = substr($name, 0, -1);
-            } elseif (substr($name, -1) == 'y') {
-                $name = substr($name, 0, -1) . 'ie';
-            }
-
-            return ucfirst($name . 's');
         }
+        $name = $this->singular_name();
+        //if the penultimate character is not a vowel, replace "y" with "ies"
+        if (preg_match('/[^aeiou]y$/i', $name ?? '')) {
+            $name = substr($name ?? '', 0, -1) . 'ie';
+        }
+        return ucfirst($name . 's');
     }
 
     public function i18n_plural_name()
@@ -473,14 +643,238 @@ abstract class ExternalDataObject extends ArrayData implements ExternalDataInter
         return _t($this->class . '.PLURALNAME', $name);
     }
 
+    private function getUniqueKeyComponents(): array
+    {
+        return $this->extend('cacheKeyComponent');
+    }
+
     //todo, but set so custom ModelAdmin wont choke...
     public function getDefaultSearchContext()
     {
+        return SearchContext::create(
+            static::class,
+            $this->scaffoldSearchFields(),
+            $this->defaultSearchFilters()
+        );
+    }
+
+    public function scaffoldSearchFields($_params = null)
+    {
+        $params = array_merge(
+            [
+                'fieldClasses' => false,
+                'restrictFields' => false
+            ],
+            (array)$_params
+        );
+        $fields = new FieldList();
+
+        foreach ($this->searchableFields() as $fieldName => $spec) {
+            if ($params['restrictFields'] && !in_array($fieldName, $params['restrictFields'] ?? [])) {
+                continue;
+            }
+
+            // If a custom fieldclass is provided as a string, use it
+            $field = null;
+            if ($params['fieldClasses'] && isset($params['fieldClasses'][$fieldName])) {
+                $fieldClass = $params['fieldClasses'][$fieldName];
+                $field = new $fieldClass($fieldName);
+            // If we explicitly set a field, then construct that
+            } elseif (isset($spec['field'])) {
+                // If it's a string, use it as a class name and construct
+                if (is_string($spec['field'])) {
+                    $fieldClass = $spec['field'];
+                    $field = new $fieldClass($fieldName);
+
+                // If it's a FormField object, then just use that object directly.
+                } elseif ($spec['field'] instanceof FormField) {
+                    $field = $spec['field'];
+
+                // Otherwise we have a bug
+                } else {
+                    user_error("Bad value for searchable_fields, 'field' value: "
+                        . var_export($spec['field'], true), E_USER_WARNING);
+                }
+
+            // Otherwise, use the database field's scaffolder
+            } elseif ($object = $this->relObject($fieldName)) {
+                if (is_object($object) && $object->hasMethod('scaffoldSearchField')) {
+                    $field = $object->scaffoldSearchField();
+                } else {
+                    throw new Exception(sprintf(
+                        "SearchField '%s' on '%s' does not return a valid DBField instance.",
+                        $fieldName,
+                        get_class($this)
+                    ));
+                }
+            }
+
+            // Allow fields to opt out of search
+            if (!$field) {
+                continue;
+            }
+
+            if (strstr($fieldName ?? '', '.')) {
+                $field->setName(str_replace('.', '__', $fieldName ?? ''));
+            }
+            $field->setTitle($spec['title']);
+
+            $fields->push($field);
+        }
+
+        // Only include general search if there are fields it can search on
+        $generalSearch = $this->getGeneralSearchFieldName();
+        if ($generalSearch !== '' && $fields->count() > 0) {
+            if ($fields->fieldByName($generalSearch) || $fields->dataFieldByName($generalSearch)) {
+                throw new LogicException('General search field name must be unique.');
+            }
+            $fields->unshift(HiddenField::create($generalSearch, _t(self::class . '.GENERALSEARCH', 'General Search')));
+        }
+
+        return $fields;
+    }
+
+    /**
+     * Get the default searchable fields for this object, as defined in the
+     * $searchable_fields list. If searchable fields are not defined on the
+     * data object, uses a default selection of summary fields.
+     *
+     * @return array
+     */
+    public function searchableFields()
+    {
+        // can have mixed format, need to make consistent in most verbose form
+        $fields = $this->config()->get('searchable_fields');
+        $labels = $this->fieldLabels();
+
+        // fallback to summary fields (unless empty array is explicitly specified)
+        if (!$fields && !is_array($fields)) {
+            $summaryFields = array_keys($this->summaryFields() ?? []);
+            $fields = [];
+
+            if ($summaryFields) {
+                foreach ($summaryFields as $name) {
+                    if ($field = $this->getDatabaseBackedField($name)) {
+                        $fields[] = $field;
+                    }
+                }
+            }
+        }
+
+        // we need to make sure the format is unified before
+        // augmenting fields, so extensions can apply consistent checks
+        // but also after augmenting fields, because the extension
+        // might use the shorthand notation as well
+
+        // rewrite array, if it is using shorthand syntax
+        $rewrite = [];
+        foreach ($fields as $name => $specOrName) {
+            $identifier = (is_int($name)) ? $specOrName : $name;
+
+            if (is_int($name)) {
+                // Format: array('MyFieldName')
+                $rewrite[$identifier] = [];
+            } elseif (is_array($specOrName) && (isset($specOrName['match_any']))) {
+                $rewrite[$identifier] = $fields[$identifier];
+                $rewrite[$identifier]['match_any'] = $specOrName['match_any'];
+            } elseif (is_array($specOrName) && ($relObject = $this->relObject($identifier))) {
+                // Format: array('MyFieldName' => array(
+                //   'filter => 'ExactMatchFilter',
+                //   'field' => 'NumericField', // optional
+                //   'title' => 'My Title', // optional
+                // ))
+                $rewrite[$identifier] = array_merge(
+                    ['filter' => $relObject->config()->get('default_search_filter_class')],
+                    (array)$specOrName
+                );
+            } else {
+                // Format: array('MyFieldName' => 'ExactMatchFilter')
+                $rewrite[$identifier] = [
+                    'filter' => $specOrName,
+                ];
+            }
+            if (!isset($rewrite[$identifier]['title'])) {
+                $rewrite[$identifier]['title'] = (isset($labels[$identifier]))
+                    ? $labels[$identifier] : FormField::name_to_label($identifier);
+            }
+            if (!isset($rewrite[$identifier]['filter'])) {
+                /** @skipUpgrade */
+                $rewrite[$identifier]['filter'] = 'PartialMatchFilter';
+            }
+        }
+
+        $fields = $rewrite;
+
+        // apply DataExtensions if present
+        $this->extend('updateSearchableFields', $fields);
+
+        return $fields;
+    }
+
+    public function getChangedFields($databaseFieldsOnly = false, $changeLevel = DataObject::CHANGE_STRICT)
+    {
+        $changedFields = [];
+
+        // Update the changed array with references to changed obj-fields
+        foreach ($this->record as $k => $v) {
+            // Prevents DBComposite infinite looping on isChanged
+            if (is_array($databaseFieldsOnly) && !in_array($k, $databaseFieldsOnly ?? [])) {
+                continue;
+            }
+            if (is_object($v) && method_exists($v, 'isChanged') && $v->isChanged()) {
+                $this->changed[$k] = DataObject::CHANGE_VALUE;
+            }
+        }
+
+        // If change was forced, then derive change data from $this->record
+        if ($this->changeForced && $changeLevel <= DataObject::CHANGE_STRICT) {
+            $changed = array_combine(
+                array_keys($this->record ?? []),
+                array_fill(0, count($this->record ?? []), DataObject::CHANGE_STRICT)
+            );
+            // @todo Find better way to allow versioned to write a new version after forceChange
+            unset($changed['Version']);
+        } else {
+            $changed = $this->changed;
+        }
+
+        if (is_array($databaseFieldsOnly)) {
+            $fields = array_intersect_key($changed ?? [], array_flip($databaseFieldsOnly ?? []));
+        } elseif ($databaseFieldsOnly) {
+            $fieldsSpecs = $this->db();
+            $fields = array_intersect_key($changed ?? [], $fieldsSpecs);
+        } else {
+            $fields = $changed;
+        }
+
+        // Filter the list to those of a certain change level
+        if ($changeLevel > DataObject::CHANGE_STRICT) {
+            if ($fields) {
+                foreach ($fields as $name => $level) {
+                    if ($level < $changeLevel) {
+                        unset($fields[$name]);
+                    }
+                }
+            }
+        }
+
+        if ($fields) {
+            foreach ($fields as $name => $level) {
+                $changedFields[$name] = [
+                    'before' => array_key_exists($name, $this->original) ? $this->original[$name] : null,
+                    'after' => array_key_exists($name, $this->record) ? $this->record[$name] : null,
+                    'level' => $level
+                ];
+            }
+        }
+
+        return $changedFields;
     }
 
     public function canCreate($member = null)
     {
         return true;
+        // @phpstan-ignore-next-line
         $extended = $this->extendedCan(__FUNCTION__, $member);
         if ($extended !== null) {
             return $extended;
@@ -491,6 +885,7 @@ abstract class ExternalDataObject extends ArrayData implements ExternalDataInter
     public function canView($member = null)
     {
         return true;
+        // @phpstan-ignore-next-line
         $extended = $this->extendedCan(__FUNCTION__, $member);
         if ($extended !== null) {
             return $extended;
@@ -569,6 +964,185 @@ abstract class ExternalDataObject extends ArrayData implements ExternalDataInter
         return $fields;
     }
 
+    /**
+     * @return boolean True if the object is in the database
+     */
+    public function isInDB()
+    {
+        return !empty($this->ID);
+    }
+
+    /**
+     * Validate the current object.
+     *
+     * By default, there is no validation - objects are always valid!  However, you can overload this method in your
+     * DataObject sub-classes to specify custom validation, or use the hook through DataExtension.
+     *
+     * Invalid objects won't be able to be written - a warning will be thrown and no write will occur.  onBeforeWrite()
+     * and onAfterWrite() won't get called either.
+     *
+     * It is expected that you call validate() in your own application to test that an object is valid before
+     * attempting a write, and respond appropriately if it isn't.
+     *
+     * @see {@link ValidationResult}
+     * @return ValidationResult
+     */
+    public function validate()
+    {
+        $result = ValidationResult::create();
+        $this->extend('validate', $result);
+        return $result;
+    }
+
+    /**
+     * Public accessor for {@see DataObject::validate()}
+     *
+     * @return ValidationResult
+     * @deprecated 4.12.0 Use validate() instead
+     */
+    public function doValidate()
+    {
+        Deprecation::notice('4.12.0', 'Use validate() instead');
+        return $this->validate();
+    }
+
+    /**
+     * Event handler called before writing to the database.
+     * You can overload this to clean up or otherwise process data before writing it to the
+     * database.  Don't forget to call parent::onBeforeWrite(), though!
+     *
+     * This called after {@link $this->validate()}, so you can be sure that your data is valid.
+     *
+     * @uses DataExtension::onBeforeWrite()
+     */
+    protected function onBeforeWrite()
+    {
+        $this->brokenOnWrite = false;
+
+        $dummy = null;
+        $this->extend('onBeforeWrite', $dummy);
+    }
+
+    /**
+     * Event handler called after writing to the database.
+     * You can overload this to act upon changes made to the data after it is written.
+     * $this->changed will have a record
+     * database.  Don't forget to call parent::onAfterWrite(), though!
+     *
+     * @uses DataExtension::onAfterWrite()
+     */
+    protected function onAfterWrite()
+    {
+        $dummy = null;
+        $this->extend('onAfterWrite', $dummy);
+    }
+
+    /**
+     * Determine validation of this object prior to write
+     *
+     * @return ValidationException|null Exception generated by this write, or null if valid
+     */
+    protected function validateWrite()
+    {
+        // Note: Validation can only be disabled at the global level, not per-model
+        if (ExternalDataObject::config()->uninherited('validation_enabled')) {
+            $result = $this->validate();
+            if (!$result->isValid()) {
+                return new ValidationException($result);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Prepare an object prior to write
+     *
+     * @throws ValidationException
+     */
+    protected function preWrite()
+    {
+        // Validate this object
+        if ($writeException = $this->validateWrite()) {
+            // Used by DODs to clean up after themselves, eg, Versioned
+            $this->invokeWithExtensions('onAfterSkippedWrite');
+            throw $writeException;
+        }
+
+        // Check onBeforeWrite
+        $this->brokenOnWrite = true;
+        $this->onBeforeWrite();
+        // @phpstan-ignore-next-line
+        if ($this->brokenOnWrite) {
+            throw new LogicException(
+                static::class . " has a broken onBeforeWrite() function."
+                . " Make sure that you call parent::onBeforeWrite()."
+            );
+        }
+    }
+
+    public function write()
+    {
+        $this->preWrite();
+
+        $this->realWrite();
+
+        return $this->record['ID'];
+    }
+
+    abstract protected function realWrite();
+
+    /**
+     * Event handler called before deleting from the database.
+     * You can overload this to clean up or otherwise process data before delete this
+     * record.  Don't forget to call parent::onBeforeDelete(), though!
+     *
+     * @uses DataExtension::onBeforeDelete()
+     */
+    protected function onBeforeDelete()
+    {
+        $this->brokenOnDelete = false;
+
+        $dummy = null;
+        $this->extend('onBeforeDelete', $dummy);
+    }
+
+    /**
+     * Delete this data object.
+     * $this->onBeforeDelete() gets called.
+     * Note that in Versioned objects, both Stage and Live will be deleted.
+     * @uses DataExtension::augmentSQL()
+     */
+    public function delete()
+    {
+        $this->brokenOnDelete = true;
+        $this->onBeforeDelete();
+        // @phpstan-ignore-next-line
+        if ($this->brokenOnDelete) {
+            throw new LogicException(
+                static::class . " has a broken onBeforeDelete() function."
+                . " Make sure that you call parent::onBeforeDelete()."
+            );
+        }
+
+        // Deleting a record without an ID shouldn't do anything
+        // @phpstan-ignore-next-line
+        if (!$this->ID) {
+            throw new LogicException("ExternalDataObject::delete() called on a ExternalDataObject without an ID");
+        }
+
+        $this->realDelete();
+
+        // Remove this item out of any caches
+        $this->flushCache();
+
+        $this->onAfterDelete();
+
+        $this->OldID = $this->ID;
+        $this->ID = 0;
+    }
+
+    abstract protected function realDelete();
+
     public function flushCache($persistent = true)
     {
         if (static::class == self::class) {
@@ -585,7 +1159,77 @@ abstract class ExternalDataObject extends ArrayData implements ExternalDataInter
 
         $this->extend('flushCache');
 
-        $this->components = [];
         return $this;
+    }
+
+    /**
+     * Reset all global caches associated with DataObject.
+     */
+    public static function reset()
+    {
+        self::$_cache_get_one = [];
+        self::$_cache_field_labels = [];
+    }
+
+    /**
+     * When extending this class and overriding this method, you will need to instantiate the CompositeValidator by
+     * calling parent::getCMSCompositeValidator(). This will ensure that the appropriate extension point is also
+     * invoked.
+     *
+     * You can also update the CompositeValidator by creating an Extension and implementing the
+     * updateCMSCompositeValidator(CompositeValidator $compositeValidator) method.
+     *
+     * @see CompositeValidator for examples of implementation
+     * @return CompositeValidator
+     */
+    public function getCMSCompositeValidator(): CompositeValidator
+    {
+        $compositeValidator = CompositeValidator::create([FieldsValidator::create()]);
+
+        // Support for the old method during the deprecation period
+        if ($this->hasMethod('getCMSValidator')) {
+            // @phpstan-ignore-next-line
+            $compositeValidator->addValidator($this->getCMSValidator());
+        }
+
+        // Extend validator - forward support, will be supported beyond 5.0.0
+        $this->invokeWithExtensions('updateCMSCompositeValidator', $compositeValidator);
+
+        return $compositeValidator;
+    }
+
+    /** @codeCoverageIgnore */
+    public function getCMSActionsOptions()
+    {
+        return [
+            'save_close' => false,
+            'save_prev_next' => false,
+            'delete_right' => false,
+        ];
+    }
+
+    private function getDatabaseBackedField(string $fieldPath): ?string
+    {
+        return null;
+    }
+
+    public function requireDefaultRecords()
+    {
+        $defaultRecords = $this->config()->uninherited('default_records');
+
+        if (!empty($defaultRecords)) {
+            $hasData = ExternalDataObject::get_one(static::class);
+            if (!$hasData) {
+                $className = static::class;
+                foreach ($defaultRecords as $record) {
+                    $obj = Injector::inst()->create($className, $record);
+                    $obj->write();
+                }
+                DB::alteration_message("Added default records to $className table", "created");
+            }
+        }
+
+        // Let any extensions make their own database default data
+        $this->extend('requireDefaultRecords', $dummy);
     }
 }

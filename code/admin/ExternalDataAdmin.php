@@ -3,6 +3,7 @@ namespace Gurucomkz\ExternalData\Admin;
 
 use Gurucomkz\ExternalData\Forms\ExternalDataGridFieldDeleteAction;
 use Gurucomkz\ExternalData\Forms\ExternalDataGridFieldDetailForm;
+use Gurucomkz\ExternalData\Model\ExternalDataObject;
 use SilverStripe\Admin\ModelAdmin;
 use SilverStripe\Control\Controller;
 use SilverStripe\Forms\FieldList;
@@ -12,6 +13,7 @@ use SilverStripe\Forms\GridField\GridFieldConfig_RecordEditor;
 use SilverStripe\Forms\GridField\GridFieldDeleteAction;
 use SilverStripe\Forms\GridField\GridFieldDetailForm;
 use SilverStripe\Forms\GridField\GridFieldFilterHeader;
+use SilverStripe\ORM\DataObjectInterface;
 
 /**
  * ExternalDataAdmin
@@ -23,22 +25,20 @@ use SilverStripe\Forms\GridField\GridFieldFilterHeader;
 
 abstract class ExternalDataAdmin extends ModelAdmin
 {
-    static $url_segment     = '';
-    static $menu_title      = 'External Data';
-    static $page_length     = 10;
-    static $default_model   = '';
+    private static $url_segment     = '';
+    private static $menu_title      = 'External Data';
+    private static $page_length     = 10;
+    private static $default_model   = '';
 
-    static $managed_models  = [
+    private static $managed_models  = [
     ];
 
-    public function getEditForm($id = null, $fields = null)
+    public function getGridField(): GridField
     {
-        $list = $this->getList();
-
         $listField = GridField::create(
             $this->sanitiseClassName($this->modelClass),
             false,
-            $list,
+            $this->getList(),
             $fieldConfig = GridFieldConfig_RecordEditor::create($this->config()->get('page_length'))
                 ->removeComponentsByType(GridFieldFilterHeader::class)
                 ->removeComponentsByType(GridFieldDetailForm::class)
@@ -46,22 +46,18 @@ abstract class ExternalDataAdmin extends ModelAdmin
                 ->addComponents(new ExternalDataGridFieldDetailForm())
                 ->addComponents(new ExternalDataGridFieldDeleteAction())
         );
+        $listField->setModelClass($this->modelClass);
+        return $listField;
+    }
 
-        // Validation
-        if (singleton($this->modelClass)->hasMethod('getCMSValidator')) {
-            $detailValidator = singleton($this->modelClass)->getCMSValidator();
-            /** @var GridFieldDetailForm $detailForm */
-            $detailForm = $listField->getConfig()->getComponentByType(GridFieldDetailForm::class);
-            $detailForm->setValidator($detailValidator);
-        }
-
+    public function getEditForm($id = null, $fields = null)
+    {
         $form = Form::create(
             $this,
             'EditForm',
-            new FieldList($listField),
+            new FieldList($this->getGridField()),
             new FieldList()
         )->setHTMLID('Form_EditForm');
-        $form->setResponseNegotiator($this->getResponseNegotiator());
         $form->addExtraClass('cms-edit-form cms-panel-padded center');
         $form->setTemplate($this->getTemplatesWithSuffix('_EditForm'));
         $editFormAction = Controller::join_links($this->Link($this->sanitiseClassName($this->modelClass)), 'EditForm');
@@ -87,6 +83,12 @@ abstract class ExternalDataAdmin extends ModelAdmin
         return $list;
     }
 
+    /**
+     * Get ExternalDataObject from the current ID
+     *
+     * @param int|DataObjectInterface $id ID or object
+     * @return DataObjectInterface|null
+     */
     public function getRecord($id)
     {
         $className = $this->modelClass;
@@ -97,17 +99,7 @@ abstract class ExternalDataAdmin extends ModelAdmin
         } elseif ($id) {
             return $className::get_by_id($id);
         } else {
-            return false;
+            return null;
         }
-    }
-
-    public function getSearchContext()
-    {
-    }
-    public function SearchForm()
-    {
-    }
-    public function ImportForm()
-    {
     }
 }

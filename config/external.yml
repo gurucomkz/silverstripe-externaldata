@@ -1,0 +1,7 @@
+---
+Name: externaldata
+---
+
+SilverStripe\ORM\DatabaseAdmin:
+  extensions:
+    - Gurucomkz\ExternalData\Extensions\ExternalBuildExtension

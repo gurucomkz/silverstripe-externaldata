@@ -1,6 +1,7 @@
 <?php
 namespace Gurucomkz\ExternalData\Forms;
 
+use Gurucomkz\ExternalData\Model\ExternalDataList;
 use SilverStripe\Admin\LeftAndMain;
 use SilverStripe\Control\Controller;
 use SilverStripe\Control\PjaxResponseNegotiator;
@@ -46,7 +47,7 @@ class ExternalDataGridFieldDetailForm_ItemRequest extends GridFieldDetailForm_It
             $list->add($this->record); //, $extraData
             //var_dump($this->record);
         } catch (ValidationException $e) {
-            $form->sessionMessage($e->getResult()->message(), 'bad');
+            $form->sessionMessage($e->getResult()->getMessages()[0], 'bad');
             $responseNegotiator = new PjaxResponseNegotiator([
                 'CurrentForm' => function () use (&$form) {
                     return $form->forTemplate();
@@ -81,16 +82,20 @@ class ExternalDataGridFieldDetailForm_ItemRequest extends GridFieldDetailForm_It
 
         if ($new_record) {
             return Controller::curr()->redirect($this->Link());
-        } elseif ($this->gridField->getList()->byId($this->record->ID)) {
-            // Return new view, as we can't do a "virtual redirect" via the CMS Ajax
-            // to the same URL (it assumes that its content is already current, and doesn't reload)
-            return $this->edit(Controller::curr()->getRequest());
         } else {
-            // Changes to the record properties might've excluded the record from
-            // a filtered list, so return back to the main view if it can't be found
-            $noActionURL = $controller->removeAction($data['url']);
-            $controller->getRequest()->addHeader('X-Pjax', 'Content');
-            return $controller->redirect($noActionURL, 302);
+            /** @var ExternalDataList */
+            $list = $this->gridField->getList();
+            if ($list->byID($this->record->ID)) {
+                // Return new view, as we can't do a "virtual redirect" via the CMS Ajax
+                // to the same URL (it assumes that its content is already current, and doesn't reload)
+                return $this->edit(Controller::curr()->getRequest());
+            } else {
+                // Changes to the record properties might've excluded the record from
+                // a filtered list, so return back to the main view if it can't be found
+                $noActionURL = $controller->removeAction($data['url']);
+                $controller->getRequest()->addHeader('X-Pjax', 'Content');
+                return $controller->redirect($noActionURL, 302);
+            }
         }
     }
 
@@ -107,7 +112,7 @@ class ExternalDataGridFieldDetailForm_ItemRequest extends GridFieldDetailForm_It
 
             $this->record->delete();
         } catch (ValidationException $e) {
-            $form->sessionMessage($e->getResult()->message(), 'bad');
+            $form->sessionMessage($e->getResult()->getMessages()[0], 'bad');
             return Controller::curr()->redirectBack();
         }
 
